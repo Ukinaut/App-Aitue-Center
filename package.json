@@ -1,0 +1,9 @@
+{
+  "name": "aitue-portal",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Portal central de aplicaciones y permisos AITUE",
+  "scripts": { "start": "node server.mjs", "test": "node --test" },
+  "engines": { "node": ">=24" }
+}
