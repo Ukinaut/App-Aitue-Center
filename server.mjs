@@ -6,10 +6,15 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { hashPassword, verifyPassword, roles, canManage, validateGrant } from './auth.mjs';
 import { initializeGb, handleGb } from './gb.mjs';
+import { initializeSatellite, handleSatellite } from './satellite.mjs';
+import { createIndustryStore, handleIndustry } from './industry.mjs';
+import { initializeTracking, handleTracking } from './tracking.mjs';
+import { startTrackingReceiver } from './tracking-receiver.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, 'data');
 mkdirSync(dataDir, { recursive: true });
+const industryStore=createIndustryStore({dataDir});
 const db = new DatabaseSync(path.join(dataDir, 'aitue.sqlite'));
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT UNIQUE NOT NULL, password TEXT NOT NULL, role TEXT NOT NULL, parent_id TEXT REFERENCES users(id), can_create INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
@@ -18,6 +23,9 @@ CREATE TABLE IF NOT EXISTS grants (user_id TEXT REFERENCES users(id), app_id TEX
 CREATE TABLE IF NOT EXISTS sessions (token TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id), expires INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, actor_id TEXT, actor_name TEXT NOT NULL, action TEXT NOT NULL, target TEXT NOT NULL, created_at TEXT NOT NULL);`);
 initializeGb(db);
+initializeSatellite(db);
+initializeTracking(db);
+const trackingReceiver=startTrackingReceiver({db});
 const all = () => db.prepare('SELECT id,name,email,role,parent_id,can_create,active,created_at FROM users ORDER BY created_at').all().map(u => ({ ...u, can_create: !!u.can_create, active: !!u.active, apps: db.prepare('SELECT app_id FROM grants WHERE user_id=?').all(u.id).map(x => x.app_id) }));
 const log = (actor, action, target) => db.prepare('INSERT INTO audit VALUES (?,?,?,?,?,?)').run(randomUUID(), actor?.id ?? null, actor?.name || 'Configuración inicial', action, target, new Date().toISOString());
 const digest = token => createHash('sha256').update(token).digest('hex');
@@ -33,9 +41,10 @@ function details(b) {
   if (typeof b.password !== 'string' || b.password.length < 12 || b.password.length > 128) fail(400, 'La contraseña debe tener entre 12 y 128 caracteres.');
 }
 const server = http.createServer(async (req, res) => {
-  res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('X-Frame-Options','DENY'); res.setHeader('Referrer-Policy','same-origin');
-  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
+  res.setHeader('X-Content-Type-Options','nosniff'); res.setHeader('X-Frame-Options','DENY'); res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');
+  res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: https://tile.openstreetmap.org https://gibs.earthdata.nasa.gov; base-uri 'none'; frame-ancestors 'none'; form-action 'self'");
   const url = new URL(req.url, 'http://localhost');
+  if(url.pathname==='/'&&url.searchParams.get('app')==='trackeo-video')res.setHeader('Content-Security-Policy',res.getHeader('Content-Security-Policy')+"; media-src 'self' blob: https: http:; connect-src 'self' https: http:; worker-src 'self' blob:");
   const secure = process.env.COOKIE_SECURE === 'true';
   const cookie = (value, age) => `aitue_session=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${age}${secure ? '; Secure' : ''}`;
   const send = (status, payload) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(payload)); };
@@ -46,6 +55,13 @@ const server = http.createServer(async (req, res) => {
       Object.assign(assets, {
         '/chrome.js': ['chrome.js','text/javascript'], '/brand.css': ['brand.css','text/css'], '/particles.js': ['particles.js','text/javascript'],
         '/gb.js': ['gb.js','text/javascript'], '/gb.css': ['gb.css','text/css'],
+        '/industry.js': ['industry.js','text/javascript'], '/industry.css': ['industry.css','text/css'],
+        '/vendor/hls/hls.min.js': ['vendor/hls/hls.min.js','text/javascript'],
+        '/reports.js': ['reports.js','text/javascript'], '/reports.css': ['reports.css','text/css'],
+        '/tracking.js': ['tracking.js','text/javascript'], '/tracking.css': ['tracking.css','text/css'],
+        '/satellite.js': ['satellite.js','text/javascript'], '/satellite-geometry.js': ['satellite-geometry.js','text/javascript'], '/satellite.css': ['satellite.css','text/css'],
+        '/vendor/leaflet/leaflet.js': ['vendor/leaflet/leaflet.js','text/javascript'], '/vendor/leaflet/leaflet.css': ['vendor/leaflet/leaflet.css','text/css'],
+        ...Object.fromEntries(['layers.png','layers-2x.png','marker-icon.png','marker-icon-2x.png','marker-shadow.png'].map(name=>['/vendor/leaflet/images/'+name,['vendor/leaflet/images/'+name,'image/png']])),
         '/brand/logo-nav.png': ['brand/logo-nav.png','image/png'], '/brand/logo-footer.png': ['brand/logo-footer.png','image/png'], '/brand/favicon.jpg': ['brand/favicon.jpg','image/jpeg'],
         '/fonts/outfit.ttf': ['fonts/outfit.ttf','font/ttf'], '/fonts/inter.ttf': ['fonts/inter.ttf','font/ttf'], '/fonts/share-tech-mono.ttf': ['fonts/share-tech-mono.ttf','font/ttf']
       });
@@ -81,13 +97,17 @@ const server = http.createServer(async (req, res) => {
       newSession(row.id); log(row,'Inició sesión',row.name); return send(200, { ok: true });
     }
     if (!actor) fail(401, 'Iniciá sesión para continuar.');
+    if (url.pathname.startsWith('/api/tracking/')) return await handleTracking({db,actor,url,method:req.method,b,send,fail,transaction,log,receiver:trackingReceiver});
+    if (url.pathname.startsWith('/api/industry/')) return handleIndustry({store:industryStore,actor,url,method:req.method,send,fail,res});
+    if (url.pathname.startsWith('/api/satellite/')) return await handleSatellite({actor,url,method:req.method,send,fail});
     if (url.pathname.startsWith('/api/gb/')) return handleGb({db,actor,users,url,method:req.method,b,send,fail,transaction,log});
     if (url.pathname === '/api/logout' && req.method === 'POST') { if (rawToken) db.prepare('DELETE FROM sessions WHERE token=?').run(digest(rawToken)); res.setHeader('Set-Cookie',cookie('',0)); return send(200,{ok:true}); }
     if (url.pathname === '/api/dashboard' && req.method === 'GET') {
       const visible = users.filter(u => u.id === actor.id || canManage(actor,u,users));
       const apps = db.prepare('SELECT * FROM apps ORDER BY name').all().filter(a => actor.role === 'superadmin' || actor.apps.includes(a.id));
       const ids = new Set(visible.map(u => u.id));
-      const audit = db.prepare('SELECT * FROM audit ORDER BY created_at DESC LIMIT 500').all().filter(a => actor.role === 'superadmin' || ids.has(a.actor_id)).slice(0,30);
+      const privateGbActions=new Set(['Asignó un equipo a un controlador','Actualizó una SIM','Registró una SIM','Actualizó un dispositivo','Registró un dispositivo','Registró consumo de GB']);
+      const audit = db.prepare('SELECT * FROM audit ORDER BY created_at DESC LIMIT 500').all().filter(a => actor.role === 'superadmin' || ids.has(a.actor_id)).slice(0,30).map(a=>!['superadmin','admin'].includes(actor.role)&&privateGbActions.has(a.action)?{...a,target:'Gestión de GB · Identidad reservada'}:a);
       return send(200,{user:actor,users:visible,apps,audit});
     }
     if (url.pathname === '/api/users' && req.method === 'POST') {
@@ -137,5 +157,5 @@ const server = http.createServer(async (req, res) => {
     fail(404,'No encontrado.');
   } catch (e) { if (!e.status) console.error(e); send(e.status || 500, {error:e.status ? e.message : 'No se pudo completar la operación.'}); }
 });
-const host=process.env.HOST || '127.0.0.1';
+const host=process.env.HOST || '0.0.0.0';
 server.listen(Number(process.env.PORT || 3100),host,() => console.log(`AITUE disponible en http://${host}:${server.address().port}`));

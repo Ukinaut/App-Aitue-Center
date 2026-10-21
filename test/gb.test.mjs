@@ -62,7 +62,9 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   const controllerId=(await root.call('dashboard')).data.users.find(u=>u.role==='controlador').id;
   assert.equal((await root.call('gb/devices',{kit:'NO-SIM',name:'Sin SIM',capacity:50,allocated:30,sim_id:null,owner_id:controllerId,active:true})).status,201);
   const controlled=(await controller.call('gb/dashboard')).data.devices[0];
-  assert.equal(controlled.kit,'NO-SIM');
+  assert.match(controlled.kit,/^GB-\d{6}$/);
+  assert.equal(controlled.kit,controlled.internal_number);
+  assert.equal(controlled.name,'Equipo con identificación interna');
   assert.equal((await controller.call('gb/usage',{device_id:controlled.id,amount:.001,date:'2026-01-05',note:''})).status,201);
   assert.equal((await root.call('gb/dashboard')).data.totals.capacity,150);
   assert.equal((await controller.call('gb/dashboard')).data.totals.used,.001);
@@ -70,9 +72,13 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   assert.equal((await controller.call('gb/usage',{device_id:controlled.id,amount:1,date:'2026-01-05',note:''})).status,400);
   assert.equal((await root.call('gb/sims',{number:'SIM-HYBRID',operator:'Móvil',capacity:100})).status,201);
   const hybridSim=(await root.call('gb/dashboard')).data.sims.find(s=>s.number==='SIM-HYBRID');
-  const hybrid={kit:'HYBRID',name:'Satelital y SIM',satellite_enabled:true,capacity:500,satellite_allocated:300,sim_id:hybridSim.id,sim_allocated:50,active:true};
+  const hybrid={kit:'HYBRID',name:'Satelital y SIM',internal_number:'00042',satellite_enabled:true,capacity:500,satellite_allocated:300,sim_id:hybridSim.id,sim_allocated:50,active:true};
   assert.equal((await root.call('gb/devices',hybrid)).status,201);
   const hybridDevice=(await root.call('gb/dashboard')).data.devices.find(d=>d.kit==='HYBRID');
+  assert.equal(hybridDevice.internal_number,'00042');
+  assert.equal((await root.call('gb/devices',{...hybrid,kit:'OTHER',sim_id:null,sim_allocated:0})).status,409);
+  assert.equal((await root.call('gb/devices/'+hybridDevice.id,{...hybrid,internal_number:'bad code'},'PATCH')).status,400);
+  assert.equal((await controller.call('gb/devices/'+hybridDevice.id,{...hybrid,internal_number:'HACK'},'PATCH')).status,403);
   assert.equal(hybridDevice.capacity,600);assert.equal(hybridDevice.allocated,350);
   const movement={device_id:hybridDevice.id,amount:50,date:'2026-01-10',note:'Satelital'};
   assert.equal((await root.call('gb/usage',movement)).status,400);
@@ -126,7 +132,20 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   assert.equal(assigned.sims.length,1);assert.equal(assigned.sims[0].id,hybridSim.id);
   assert.equal(assigned.usage.length,3);
   assert.equal(assigned.controllers.length,0);assert.equal(assigned.owners.length,0);
-  assert.equal((await controller.call('gb/report?from=2026-01-01&to=2026-02-28')).data.total,70.001);
+  assert.equal(assigned.devices.find(d=>d.id===hybridDevice.id).kit,'00042');
+  assert.equal(assigned.sims[0].number,'Reservada');
+  assert.equal(assigned.sims[0].kit,'00042');
+  for(const secret of ['HYBRID','Satelital y SIM','SIM-HYBRID'])assert.ok(!JSON.stringify(assigned).includes(secret));
+  const maskedReport=(await controller.call('gb/report?from=2026-01-01&to=2026-02-28')).data;
+  assert.equal(maskedReport.rows.find(d=>d.id===hybridDevice.id).kit,'00042');
+  assert.equal(maskedReport.entries.find(d=>d.device_id===hybridDevice.id).kit,'00042');
+  assert.ok(maskedReport.entries.every(e=>e.note===''));
+  for(const secret of ['HYBRID','Satelital y SIM','SIM-HYBRID'])assert.ok(!JSON.stringify(maskedReport).includes(secret));
+  const privateNote='HYBRID SIM-HYBRID';
+  assert.equal((await controller.call('gb/usage',{...movement,source:'sim',amount:0.001,note:privateNote})).status,201);
+  const auditView=(await controller.call('dashboard')).data.audit;
+  assert.ok(!JSON.stringify(auditView).includes('HYBRID'));
+  assert.equal((await controller.call('gb/report?from=2026-01-01&to=2026-02-28')).data.total,70.002);
   assert.equal((await controller.call('gb/usage',{...movement,source:'sim',amount:1})).status,201);
   assert.equal((await controller.call('gb/usage',record)).status,404);
   assert.equal((await controller.call(`gb/report?from=2026-01-01&to=2026-02-28&device=${device.id}`)).status,404);
@@ -139,9 +158,9 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   assert.equal((await controller.call(`gb/report?from=2026-01-01&to=2026-02-28&device=${hybridDevice.id}`)).status,404);
   const secondPanel=(await second.call('gb/dashboard')).data;
   assert.equal(secondPanel.devices.length,1);
-  assert.equal(secondPanel.totals.devices,1);assert.equal(secondPanel.totals.used,71);
+  assert.equal(secondPanel.totals.devices,1);assert.equal(secondPanel.totals.used,71.001);
   assert.equal(secondPanel.sims[0].id,hybridSim.id);
-  assert.equal((await second.call('gb/report?from=2026-01-01&to=2026-02-28')).data.total,71);
+  assert.equal((await second.call('gb/report?from=2026-01-01&to=2026-02-28')).data.total,71.001);
   // Modificar el plan no borra una asignación existente.
   assert.equal((await admin.call('gb/devices/'+hybridDevice.id,hybrid,'PATCH')).status,200);
   assert.equal((await second.call('gb/dashboard')).data.devices[0].controller_id,secondId);
@@ -149,7 +168,7 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   assert.equal((await second.call('gb/dashboard')).data.devices.length,0);
   assert.equal((await second.call('gb/dashboard')).data.totals.used,0);
   assert.equal((await root.call('gb/dashboard')).data.devices.length,3);
-  assert.equal((await root.call('gb/dashboard')).data.devices.find(d=>d.id===hybridDevice.id).used,71);
+  assert.equal((await root.call('gb/dashboard')).data.devices.find(d=>d.id===hybridDevice.id).used,71.001);
   assert.equal((await root.call('users/'+secondId,{active:false},'PATCH')).status,200);
   assert.equal((await assign(admin,hybridDevice.id,secondId)).status,400);
   // Ser superior jerárquico no permite heredar los equipos de un subusuario.
@@ -160,7 +179,24 @@ test('Gestión GB: saldos, reportes, asignaciones y aislamiento entre controlado
   assert.equal((await root.call('gb/devices',{kit:'CHILD',name:'Equipo del subusuario',capacity:10,allocated:5,sim_id:null,owner_id:childId,active:true})).status,201);
   assert.equal((await controller.call('gb/dashboard')).data.devices.some(d=>d.kit==='CHILD'),false);
   const childClient=client();await childClient.call('login',{email:'child@gb.test',password});
-  assert.equal((await childClient.call('gb/dashboard')).data.devices[0].kit,'CHILD');
+  const childDevice=(await childClient.call('gb/dashboard')).data.devices[0];
+  assert.equal(childDevice.kit,childDevice.internal_number);
+  assert.ok(!JSON.stringify((await childClient.call('gb/dashboard')).data).includes('CHILD'));
+  const editableChild={kit:'CHILD',name:'Equipo del subusuario',capacity:10,allocated:5,sim_id:null,owner_id:childId,active:true};
+  assert.equal((await admin.call('gb/devices/'+childDevice.id,{...editableChild,internal_number:'REF-07'},'PATCH')).status,200);
+  assert.equal((await admin.call('gb/devices/'+hybridDevice.id,{...hybrid,internal_number:'ref-07'},'PATCH')).status,409);
+  assert.equal((await admin.call('gb/devices/'+childDevice.id,editableChild,'PATCH')).status,200);
+  assert.equal((await childClient.call('gb/dashboard')).data.devices[0].kit,'REF-07');
+  // El usuario final tampoco recibe kit, nombre, SIM ni observaciones privadas.
+  assert.equal((await root.call('gb/devices/'+hybridDevice.id,{...hybrid,owner_id:childId},'PATCH')).status,200);
+  for(const route of ['gb/dashboard','gb/report?from=2026-01-01&to=2026-02-28']){
+    const response=(await childClient.call(route)).data;
+    for(const secret of ['HYBRID','Satelital y SIM','SIM-HYBRID'])assert.ok(!JSON.stringify(response).includes(secret));
+  }
+  const adminReport=(await admin.call('gb/report?from=2026-01-01&to=2026-02-28')).data;
+  assert.equal(adminReport.rows.find(d=>d.id===hybridDevice.id).kit,'HYBRID');
+  assert.equal(adminReport.rows.find(d=>d.id===hybridDevice.id).sim_number,'SIM-HYBRID');
+  assert.ok(adminReport.entries.some(e=>e.note===privateNote));
 
 });
 
@@ -183,5 +219,9 @@ test('Migración GB conserva cantidades y atribuye los consumos anteriores a su 
     assert.equal(db.prepare('SELECT SUM(amount) total FROM gb_usage').get().total,62500);
     assert.equal(db.prepare('SELECT controller_id FROM gb_devices WHERE id=?').get('mobile').controller_id,'owner');
     assert.equal(db.prepare('SELECT controller_id FROM gb_devices WHERE id=?').get('sat').controller_id,null);
+    const codes=db.prepare('SELECT internal_number FROM gb_devices ORDER BY rowid').all().map(d=>d.internal_number);
+    assert.deepEqual(codes,['GB-000001','GB-000002']);
+    initializeGb(db);
+    assert.deepEqual(db.prepare('SELECT internal_number FROM gb_devices ORDER BY rowid').all().map(d=>d.internal_number),codes);
   }finally{db.close();}
 });

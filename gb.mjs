@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
 export const GB_APP = 'aitue-gestion-gb';
+function nextInternalNumber(db) {
+  let n=1;
+  while(db.prepare('SELECT 1 FROM gb_devices WHERE internal_number=? COLLATE NOCASE').get(`GB-${String(n).padStart(6,'0')}`))n++;
+  return `GB-${String(n).padStart(6,'0')}`;
+}
 export function initializeGb(db) {
   db.exec(`CREATE TABLE IF NOT EXISTS gb_sims(id TEXT PRIMARY KEY, number TEXT UNIQUE NOT NULL, operator TEXT NOT NULL, capacity INTEGER NOT NULL CHECK(capacity>=0), owner_id TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL);
   CREATE TABLE IF NOT EXISTS gb_devices(id TEXT PRIMARY KEY, kit TEXT UNIQUE NOT NULL, name TEXT NOT NULL, sim_id TEXT UNIQUE REFERENCES gb_sims(id), capacity INTEGER NOT NULL CHECK(capacity>=0), allocated INTEGER NOT NULL CHECK(allocated>=0), owner_id TEXT NOT NULL REFERENCES users(id), active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
@@ -24,6 +29,9 @@ export function initializeGb(db) {
       db.exec(`ALTER TABLE gb_devices ADD COLUMN controller_id TEXT REFERENCES users(id);
       UPDATE gb_devices SET controller_id=owner_id WHERE owner_id IN (SELECT id FROM users WHERE role='controlador');`);
     }
+    if(!db.prepare('PRAGMA table_info(gb_devices)').all().some(c=>c.name==='internal_number'))db.exec('ALTER TABLE gb_devices ADD COLUMN internal_number TEXT');
+    for(const d of db.prepare('SELECT id FROM gb_devices WHERE internal_number IS NULL ORDER BY rowid').all())db.prepare('UPDATE gb_devices SET internal_number=? WHERE id=?').run(nextInternalNumber(db),d.id);
+    db.exec('CREATE UNIQUE INDEX IF NOT EXISTS gb_devices_internal_number ON gb_devices(internal_number COLLATE NOCASE)');
     db.exec('CREATE INDEX IF NOT EXISTS gb_devices_controller ON gb_devices(controller_id)');
     db.exec('COMMIT');
   } catch(error){db.exec('ROLLBACK');throw error;}
@@ -60,8 +68,11 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
   const devices=rawDevices.filter(visible),deviceIds=new Set(devices.map(d=>d.id));
   const sims=db.prepare(`SELECT s.*,d.kit,d.id device_id,d.owner_id device_owner,COALESCE((SELECT SUM(u.amount) FROM gb_usage u JOIN gb_devices d2 ON d2.id=u.device_id WHERE d2.sim_id=s.id AND u.source='sim'),0) used FROM gb_sims s LEFT JOIN gb_devices d ON d.sim_id=s.id ORDER BY s.created_at DESC`).all().filter(s=>manager||deviceIds.has(s.device_id));
   const balance=(capacity,allocated,used)=>({capacity:capacity/1000,allocated:allocated/1000,used:used/1000,remaining:(allocated-used)/1000,plan_remaining:(capacity-used)/1000});
-  const serializeDevice=d=>({...d,controller_name:users.find(u=>u.id===d.controller_id)?.name||null,capacity:((d.satellite_enabled?d.capacity:0)+(d.sim_capacity||0))/1000,allocated:d.allocated/1000,used:d.used/1000,remaining:(d.allocated-d.used)/1000,active:!!d.active,satellite:{enabled:!!d.satellite_enabled,...balance(d.satellite_enabled?d.capacity:0,d.satellite_allocated,d.satellite_used)},sim:{enabled:!!d.sim_id,...balance(d.sim_capacity||0,d.sim_allocated,d.sim_used)}});
-  const serializeSim=s=>({...s,can_edit:manager&&scope.has(s.owner_id)&&(!s.device_id||scope.has(s.device_owner)),capacity:s.capacity/1000,used:s.used/1000,remaining:(s.capacity-s.used)/1000});
+  // La identidad se reemplaza en el servidor: tampoco viaja en JSON ni exportaciones.
+  const identity=d=>({internal_number:d.internal_number,kit:manager?d.kit:d.internal_number,name:manager?d.name:'Equipo con identificación interna',sim_number:manager?d.sim_number:(d.sim_id?'Reservada':null)});
+  const serializeDevice=d=>({...d,...identity(d),controller_name:users.find(u=>u.id===d.controller_id)?.name||null,capacity:((d.satellite_enabled?d.capacity:0)+(d.sim_capacity||0))/1000,allocated:d.allocated/1000,used:d.used/1000,remaining:(d.allocated-d.used)/1000,active:!!d.active,satellite:{enabled:!!d.satellite_enabled,...balance(d.satellite_enabled?d.capacity:0,d.satellite_allocated,d.satellite_used)},sim:{enabled:!!d.sim_id,...balance(d.sim_capacity||0,d.sim_allocated,d.sim_used)}});
+  const serializeSim=s=>({...s,...(!manager?{number:'Reservada',kit:devices.find(d=>d.id===s.device_id)?.internal_number||null}:{}),can_edit:manager&&scope.has(s.owner_id)&&(!s.device_id||scope.has(s.device_owner)),capacity:s.capacity/1000,used:s.used/1000,remaining:(s.capacity-s.used)/1000});
+  const serializeUsage=u=>{const d=devices.find(d=>d.id===u.device_id);return {...u,...identity(d),sim_number:u.source==='sim'?identity(d).sim_number:null,note:manager?u.note:'',amount:u.amount/1000};};
   const route=url.pathname.slice('/api/gb/'.length);
   if(route==='dashboard'&&method==='GET'){
     const satelliteCapacity=devices.reduce((sum,d)=>sum+(d.satellite_enabled?d.capacity:0),0);
@@ -70,7 +81,7 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
     const allocated=devices.reduce((sum,d)=>sum+d.allocated,0),used=devices.reduce((sum,d)=>sum+d.used,0);
     const usage=db.prepare(`SELECT u.*,d.kit,d.name,d.owner_id,a.name actor_name FROM gb_usage u JOIN gb_devices d ON d.id=u.device_id JOIN users a ON a.id=u.actor_id ORDER BY u.date DESC,u.created_at DESC`).all().filter(u=>deviceIds.has(u.device_id));
     const channels={satellite:balance(satelliteCapacity,devices.reduce((sum,d)=>sum+d.satellite_allocated,0),devices.reduce((sum,d)=>sum+d.satellite_used,0)),sim:balance(simCapacity,devices.reduce((sum,d)=>sum+d.sim_allocated,0),devices.reduce((sum,d)=>sum+d.sim_used,0))};
-    return send(200,{devices:devices.map(serializeDevice),sims:sims.map(serializeSim),owners:manager?owners.map(u=>({id:u.id,name:u.name})):[],controllers:controllers.map(u=>({id:u.id,name:u.name})),canManage:manager,canRecord:writer,channels,totals:{capacity:capacity/1000,allocated:allocated/1000,used:used/1000,remaining:(capacity-used)/1000,unallocated:(capacity-allocated)/1000,devices:devices.length,active:devices.filter(d=>d.active).length,sims:sims.length},usage:usage.slice(0,30).map(u=>({...u,amount:u.amount/1000}))});
+    return send(200,{devices:devices.map(serializeDevice),sims:sims.map(serializeSim),owners:manager?owners.map(u=>({id:u.id,name:u.name})):[],controllers:controllers.map(u=>({id:u.id,name:u.name})),canManage:manager,canRecord:writer,channels,totals:{capacity:capacity/1000,allocated:allocated/1000,used:used/1000,remaining:(capacity-used)/1000,unallocated:(capacity-allocated)/1000,devices:devices.length,active:devices.filter(d=>d.active).length,sims:sims.length},usage:usage.slice(0,30).map(serializeUsage)});
   }
   if(route==='report'&&method==='GET'){
     const from=date(url.searchParams.get('from')),to=date(url.searchParams.get('to'));if(from>to)fail(400,'La fecha inicial debe ser anterior a la final.');
@@ -78,8 +89,8 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
     const source=url.searchParams.get('source')||'';if(source&&!['satellite','sim'].includes(source))fail(400,'Tipo de conexión inválido.');
     const selected=devices.filter(d=>!deviceId||d.id===deviceId);
     const entries=db.prepare(`SELECT u.*,d.kit,d.name,d.owner_id,CASE WHEN u.source='sim' THEN s.number ELSE NULL END sim_number,a.name actor_name FROM gb_usage u JOIN gb_devices d ON d.id=u.device_id LEFT JOIN gb_sims s ON s.id=d.sim_id JOIN users a ON a.id=u.actor_id WHERE u.date>=? AND u.date<=? ORDER BY u.date,u.created_at`).all(from,to).filter(u=>deviceIds.has(u.device_id)&&(!deviceId||u.device_id===deviceId)&&(!source||u.source===source));
-    const rows=selected.map(d=>{const own=entries.filter(e=>e.device_id===d.id);return {id:d.id,kit:d.kit,name:d.name,sim_number:d.sim_number,allocated:d.allocated/1000,used:own.reduce((sum,e)=>sum+e.amount,0)/1000,satellite_used:own.filter(e=>e.source==='satellite').reduce((sum,e)=>sum+e.amount,0)/1000,sim_used:own.filter(e=>e.source==='sim').reduce((sum,e)=>sum+e.amount,0)/1000,records:own.length};});
-    return send(200,{from,to,source,rows,total:entries.reduce((sum,e)=>sum+e.amount,0)/1000,entries:entries.map(e=>({...e,amount:e.amount/1000}))});
+    const rows=selected.map(d=>{const own=entries.filter(e=>e.device_id===d.id);return {id:d.id,...identity(d),allocated:d.allocated/1000,used:own.reduce((sum,e)=>sum+e.amount,0)/1000,satellite_used:own.filter(e=>e.source==='satellite').reduce((sum,e)=>sum+e.amount,0)/1000,sim_used:own.filter(e=>e.source==='sim').reduce((sum,e)=>sum+e.amount,0)/1000,records:own.length};});
+    return send(200,{from,to,source,rows,total:entries.reduce((sum,e)=>sum+e.amount,0)/1000,entries:entries.map(serializeUsage)});
   }
   if(/^devices\/[^/]+\/assignment$/.test(route)&&method==='PATCH'){
     if(!manager)fail(403,'Solo un administrador puede asignar equipos.');
@@ -103,6 +114,9 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
     if(!manager)fail(403,'Solo un administrador puede administrar dispositivos.');
     const existing=method==='PATCH'?own(rawDevices.find(d=>d.id===route.split('/')[1])):null;
     const kit=text(b.kit,'el número de kit',80),name=text(b.name,'el nombre del equipo',100),simId=b.sim_id||null,ownerId=owner(b.owner_id??actor.id);
+    const internalNumber=b.internal_number===undefined?(existing?.internal_number||nextInternalNumber(db)):text(b.internal_number,'el número interno',40);
+    if(!/^[a-z0-9][a-z0-9._/-]{0,39}$/i.test(internalNumber))fail(400,'El número interno admite hasta 40 letras, números, puntos, guiones, barras y guiones bajos.');
+    if(db.prepare('SELECT id FROM gb_devices WHERE internal_number=? COLLATE NOCASE AND id<>?').get(internalNumber,existing?.id||''))fail(409,'Ese número interno ya existe.');
     const requestedController=b.controller_id===undefined?(existing?existing.controller_id:(controllers.some(u=>u.id===ownerId)?ownerId:null)):b.controller_id||null;
     const controllerId=existing&&requestedController===existing.controller_id?requestedController:controller(requestedController);
     const satelliteEnabled=b.satellite_enabled??!simId;
@@ -121,7 +135,7 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
     if(satelliteAllocated>(satelliteEnabled?capacity:0)||simAllocated>maxSim)fail(400,'Los GB asignados no pueden superar el plan de cada conexión.');
     if(existing&&(satelliteAllocated<existing.satellite_used||simAllocated<existing.sim_used))fail(400,'La asignación de cada conexión no puede ser menor que su consumo registrado.');
     if(existing?.sim_used>0&&simId!==existing.sim_id)fail(400,'La SIM tiene consumos. Conservá su vínculo para mantener el historial.');
-    transaction(()=>{if(simId)db.prepare('UPDATE gb_sims SET owner_id=? WHERE id=?').run(ownerId,simId);if(existing)db.prepare('UPDATE gb_devices SET kit=?,name=?,sim_id=?,capacity=?,allocated=?,owner_id=?,active=?,satellite_enabled=?,satellite_allocated=?,sim_allocated=?,controller_id=? WHERE id=?').run(kit,name,simId,capacity,allocated,ownerId,Number(b.active),Number(satelliteEnabled),satelliteAllocated,simAllocated,controllerId,existing.id);else db.prepare('INSERT INTO gb_devices (id,kit,name,sim_id,capacity,allocated,owner_id,active,created_at,satellite_enabled,satellite_allocated,sim_allocated,controller_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)').run(randomUUID(),kit,name,simId,capacity,allocated,ownerId,Number(b.active),new Date().toISOString(),Number(satelliteEnabled),satelliteAllocated,simAllocated,controllerId);log(actor,existing?'Actualizó un dispositivo':'Registró un dispositivo',kit);});return send(existing?200:201,{ok:true});
+    transaction(()=>{if(simId)db.prepare('UPDATE gb_sims SET owner_id=? WHERE id=?').run(ownerId,simId);if(existing)db.prepare('UPDATE gb_devices SET kit=?,name=?,sim_id=?,capacity=?,allocated=?,owner_id=?,active=?,satellite_enabled=?,satellite_allocated=?,sim_allocated=?,controller_id=?,internal_number=? WHERE id=?').run(kit,name,simId,capacity,allocated,ownerId,Number(b.active),Number(satelliteEnabled),satelliteAllocated,simAllocated,controllerId,internalNumber,existing.id);else db.prepare('INSERT INTO gb_devices (id,kit,name,sim_id,capacity,allocated,owner_id,active,created_at,satellite_enabled,satellite_allocated,sim_allocated,controller_id,internal_number) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)').run(randomUUID(),kit,name,simId,capacity,allocated,ownerId,Number(b.active),new Date().toISOString(),Number(satelliteEnabled),satelliteAllocated,simAllocated,controllerId,internalNumber);log(actor,existing?'Actualizó un dispositivo':'Registró un dispositivo',kit);});return send(existing?200:201,{ok:true});
   }
   if(route==='usage'&&method==='POST'){
     if(!writer)fail(403,'Tu cuenta tiene acceso de lectura.');
@@ -132,7 +146,7 @@ export function handleGb({db,actor,users,url,method,b,send,fail,transaction,log}
     const value=amount(b.amount,'Consumo en GB',true),day=date(b.date),note=text(b.note??'','la observación',500,false);
     const today=new Intl.DateTimeFormat('en-CA',{timeZone:'America/Argentina/Buenos_Aires',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date());
     if(day>today)fail(400,'No se pueden registrar consumos futuros.');
-    transaction(()=>{const current=db.prepare('SELECT COALESCE(SUM(amount),0) used FROM gb_usage WHERE device_id=? AND source=?').get(device.id,source).used;const limit=source==='sim'?device.sim_allocated:device.satellite_allocated;if(current+value>limit)fail(400,'El consumo supera los GB asignados a esa conexión.');db.prepare('INSERT INTO gb_usage (id,device_id,amount,date,note,actor_id,created_at,source) VALUES (?,?,?,?,?,?,?,?)').run(randomUUID(),device.id,value,day,note,actor.id,new Date().toISOString(),source);log(actor,'Registró consumo de GB',`${device.kit} · ${source==='sim'?'SIM':'Satelital'}: ${value/1000} GB`);});return send(201,{ok:true});
+    transaction(()=>{const current=db.prepare('SELECT COALESCE(SUM(amount),0) used FROM gb_usage WHERE device_id=? AND source=?').get(device.id,source).used;const limit=source==='sim'?device.sim_allocated:device.satellite_allocated;if(current+value>limit)fail(400,'El consumo supera los GB asignados a esa conexión.');db.prepare('INSERT INTO gb_usage (id,device_id,amount,date,note,actor_id,created_at,source) VALUES (?,?,?,?,?,?,?,?)').run(randomUUID(),device.id,value,day,note,actor.id,new Date().toISOString(),source);log(actor,'Registró consumo de GB',`${device.internal_number} · ${source==='sim'?'SIM':'Satelital'}: ${value/1000} GB`);});return send(201,{ok:true});
   }
   fail(404,'Operación de Gestión de GB no encontrada.');
 }
