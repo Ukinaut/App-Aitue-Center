@@ -10,6 +10,7 @@ import { initializeSatellite, handleSatellite } from './satellite.mjs';
 import { createIndustryStore, handleIndustry } from './industry.mjs';
 import { initializeTracking, handleTracking } from './tracking.mjs';
 import { startTrackingReceiver } from './tracking-receiver.mjs';
+import { initializeAlerts, evaluateAlerts, handleAlerts } from './alerts.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, 'data');
@@ -25,7 +26,10 @@ CREATE TABLE IF NOT EXISTS audit (id TEXT PRIMARY KEY, actor_id TEXT, actor_name
 initializeGb(db);
 initializeSatellite(db);
 initializeTracking(db);
+initializeAlerts(db);
 const trackingReceiver=startTrackingReceiver({db});
+const evaluate=()=>{try{evaluateAlerts(db);}catch(error){console.error('No se pudieron evaluar las alertas.',error.message);}};
+evaluate();setInterval(evaluate,30000).unref();
 const all = () => db.prepare('SELECT id,name,email,role,parent_id,can_create,active,created_at FROM users ORDER BY created_at').all().map(u => ({ ...u, can_create: !!u.can_create, active: !!u.active, apps: db.prepare('SELECT app_id FROM grants WHERE user_id=?').all(u.id).map(x => x.app_id) }));
 const log = (actor, action, target) => db.prepare('INSERT INTO audit VALUES (?,?,?,?,?,?)').run(randomUUID(), actor?.id ?? null, actor?.name || 'Configuración inicial', action, target, new Date().toISOString());
 const digest = token => createHash('sha256').update(token).digest('hex');
@@ -54,10 +58,11 @@ const server = http.createServer(async (req, res) => {
       const assets = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/theme.css': ['theme.css','text/css'], '/favicon.svg': ['favicon.svg','image/svg+xml'], '/fonts/manrope.ttf': ['fonts/manrope.ttf','font/ttf'], '/fonts/syne.ttf': ['fonts/syne.ttf','font/ttf'] };
       Object.assign(assets, {
         '/chrome.js': ['chrome.js','text/javascript'], '/brand.css': ['brand.css','text/css'], '/particles.js': ['particles.js','text/javascript'],
-        '/gb.js': ['gb.js','text/javascript'], '/gb.css': ['gb.css','text/css'],
+        '/gb.js': ['gb.js','text/javascript'], '/gb-billing.js': ['gb-billing.js','text/javascript'], '/gb.css': ['gb.css','text/css'],
         '/industry.js': ['industry.js','text/javascript'], '/industry.css': ['industry.css','text/css'],
         '/vendor/hls/hls.min.js': ['vendor/hls/hls.min.js','text/javascript'],
         '/reports.js': ['reports.js','text/javascript'], '/reports.css': ['reports.css','text/css'],
+        '/alerts.js': ['alerts.js','text/javascript'], '/alerts.css': ['alerts.css','text/css'],
         '/tracking.js': ['tracking.js','text/javascript'], '/tracking.css': ['tracking.css','text/css'],
         '/satellite.js': ['satellite.js','text/javascript'], '/satellite-geometry.js': ['satellite-geometry.js','text/javascript'], '/satellite.css': ['satellite.css','text/css'],
         '/vendor/leaflet/leaflet.js': ['vendor/leaflet/leaflet.js','text/javascript'], '/vendor/leaflet/leaflet.css': ['vendor/leaflet/leaflet.css','text/css'],
@@ -97,7 +102,8 @@ const server = http.createServer(async (req, res) => {
       newSession(row.id); log(row,'Inició sesión',row.name); return send(200, { ok: true });
     }
     if (!actor) fail(401, 'Iniciá sesión para continuar.');
-    if (url.pathname.startsWith('/api/tracking/')) return await handleTracking({db,actor,url,method:req.method,b,send,fail,transaction,log,receiver:trackingReceiver});
+    if (url.pathname.startsWith('/api/alerts/')) return handleAlerts({db,actor,url,method:req.method,b,send,fail,transaction,log});
+    if (url.pathname.startsWith('/api/tracking/')) return await handleTracking({db,actor,users,url,method:req.method,b,send,fail,transaction,log,receiver:trackingReceiver});
     if (url.pathname.startsWith('/api/industry/')) return handleIndustry({store:industryStore,actor,url,method:req.method,send,fail,res});
     if (url.pathname.startsWith('/api/satellite/')) return await handleSatellite({actor,url,method:req.method,send,fail});
     if (url.pathname.startsWith('/api/gb/')) return handleGb({db,actor,users,url,method:req.method,b,send,fail,transaction,log});
@@ -107,7 +113,8 @@ const server = http.createServer(async (req, res) => {
       const apps = db.prepare('SELECT * FROM apps ORDER BY name').all().filter(a => actor.role === 'superadmin' || actor.apps.includes(a.id));
       const ids = new Set(visible.map(u => u.id));
       const privateGbActions=new Set(['Asignó un equipo a un controlador','Actualizó una SIM','Registró una SIM','Actualizó un dispositivo','Registró un dispositivo','Registró consumo de GB']);
-      const audit = db.prepare('SELECT * FROM audit ORDER BY created_at DESC LIMIT 500').all().filter(a => actor.role === 'superadmin' || ids.has(a.actor_id)).slice(0,30).map(a=>!['superadmin','admin'].includes(actor.role)&&privateGbActions.has(a.action)?{...a,target:'Gestión de GB · Identidad reservada'}:a);
+      const privateTrackingActions=new Set(['Registró unidad de trackeo','Editó unidad de trackeo','Registró posición manual','Reactivó unidad de trackeo','Archivó unidad de trackeo','Registró dispositivo GPS','Editó dispositivo GPS','Vinculó cámara a dispositivo','Editó cámara vinculada','Configuró clave de recepción GPS','Asignó accesos de trackeo']);
+      const audit = db.prepare('SELECT * FROM audit ORDER BY created_at DESC LIMIT 500').all().filter(a => actor.role === 'superadmin' || ids.has(a.actor_id)).slice(0,30).map(a=>!['superadmin','admin'].includes(actor.role)&&privateGbActions.has(a.action)?{...a,target:'Gestión de GB · Identidad reservada'}:!['superadmin','admin'].includes(actor.role)&&privateTrackingActions.has(a.action)?{...a,target:'Trackeo · Identidad reservada'}:a);
       return send(200,{user:actor,users:visible,apps,audit});
     }
     if (url.pathname === '/api/users' && req.method === 'POST') {

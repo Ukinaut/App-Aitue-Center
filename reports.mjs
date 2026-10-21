@@ -1,3 +1,4 @@
+import { trackingScope, trackingIdentity } from './tracking-access.mjs';
 const DAY=86400000;
 const invalid=message=>{throw Object.assign(Error(message),{status:400});};
 const types={vehicle:'Vehículo',aircraft:'Aeronave',person:'Persona',equipment:'Equipo',camera:'Cámara',other:'Otra unidad'};
@@ -21,16 +22,17 @@ export function buildSatelliteReport(data,params,now=Date.now()){
     charts:[{title:'Reportes por fenómeno',rows:countBy(rows,'category').map(r=>({...r,label:events[r.label]||r.label}))},{title:'Reportes por nivel',rows:countBy(rows,'level').map(r=>({...r,label:levels[r.label]||r.label}))},{title:'Reportes por día · UTC',type:'timeline',rows:daily(period,byDay)},{title:'Reportes por fuente',rows:countBy(rows,'source')}],
     table:{columns:[['title','Reporte'],['category','Fenómeno'],['source','Fuente'],['level','Nivel publicado'],['time','Fecha del evento · UTC'],['country','País informado'],['source_status','Estado de la fuente']],rows:rows.sort((a,b)=>b.time.localeCompare(a.time)).map(e=>({title:e.title,category:events[e.category]||e.category,source:e.source,level:levels[e.level]||e.level,time:e.time,country:e.country||'Sin informar',source_status:({ok:'Disponible',stale:'Datos anteriores',unavailable:'No disponible'})[data.sources.find(s=>s.id===e.source_id)?.status]||'Sin información'}))}};
 }
-export function buildTrackingReport(db,params,now=Date.now()){
+export function buildTrackingReport(db,params,now=Date.now(),actor=null){
   const period=reportPeriod(params,30,now),kind=option(params,'kind',Object.keys(types)),status=option(params,'status',['active','archived']),source=option(params,'source',['manual','wialon','rinho']),unit=params.get('unit')||'';
   if(unit.length>80)invalid('Unidad inválida.');
-  const allUnits=db.prepare('SELECT id,name FROM tracking_units ORDER BY name').all();if(unit&&!allUnits.some(u=>u.id===unit))invalid('Unidad no disponible.');
-  const terms=[],values=[];if(kind){terms.push('u.kind=?');values.push(kind);}if(status){terms.push('u.active=?');values.push(status==='active'?1:0);}if(unit){terms.push('u.id=?');values.push(unit);}const where=terms.length?'WHERE '+terms.join(' AND '):'';
+  const scope=trackingScope(actor);
+  const allUnits=db.prepare(`SELECT u.id,u.name,u.internal_number FROM tracking_units u WHERE ${scope.sql} ORDER BY u.name`).all(...scope.values).map(u=>trackingIdentity(u,actor));if(unit&&!allUnits.some(u=>u.id===unit))invalid('Unidad no disponible.');
+  const terms=[scope.sql],values=[...scope.values];if(kind){terms.push('u.kind=?');values.push(kind);}if(status){terms.push('u.active=?');values.push(status==='active'?1:0);}if(unit){terms.push('u.id=?');values.push(unit);}const where='WHERE '+terms.join(' AND ');
   const periodTerms='p.recorded_at>=? AND p.recorded_at<=?'+(source?' AND p.source=?':''),periodValues=[period.from,period.to,...(source?[source]:[])];
-  const rows=db.prepare(`SELECT u.id,u.name,u.identifier,u.kind,u.active,COUNT(p.id) samples,
+  const rows=db.prepare(`SELECT u.id,u.name,u.identifier,u.internal_number,u.kind,u.active,COUNT(p.id) samples,
     SUM(CASE WHEN p.source='manual' THEN 1 ELSE 0 END) manual,SUM(CASE WHEN p.source='wialon' THEN 1 ELSE 0 END) wialon,SUM(CASE WHEN p.source='rinho' THEN 1 ELSE 0 END) rinho,
     MIN(p.recorded_at) first_at,MAX(p.recorded_at) last_at,MAX(p.speed) max_speed
-    FROM tracking_units u LEFT JOIN tracking_positions p ON p.unit_id=u.id AND ${periodTerms} ${where} GROUP BY u.id ORDER BY samples DESC,u.name,u.id`).all(...periodValues,...values);
+    FROM tracking_units u LEFT JOIN tracking_positions p ON p.unit_id=u.id AND ${periodTerms} ${where} GROUP BY u.id ORDER BY samples DESC,u.name,u.id`).all(...periodValues,...values).map(u=>trackingIdentity(u,actor));
   const days=db.prepare(`SELECT substr(p.recorded_at,1,10) day,COUNT(*) n FROM tracking_positions p JOIN tracking_units u ON u.id=p.unit_id ${where?where+' AND ':'WHERE '}${periodTerms} GROUP BY day ORDER BY day`).all(...values,...periodValues);
   const deviceCount=db.prepare(`SELECT COUNT(*) n FROM tracking_devices d JOIN tracking_units u ON u.id=d.unit_id ${where}`).get(...values).n;
   const cameraCount=db.prepare(`SELECT COUNT(*) n FROM tracking_cameras c JOIN tracking_devices d ON d.id=c.device_id JOIN tracking_units u ON u.id=d.unit_id ${where}`).get(...values).n;

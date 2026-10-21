@@ -38,7 +38,7 @@ test('GPS y cámaras: IMEI y PSN como texto, duplicados, asignaciones y permisos
   assert.equal(call('dashboard').data.devices[0].unit_id,other);
   assert.equal(call('units/'+id+'/history').data.positions.length,1,'La reasignación no mueve posiciones históricas');
   assert.equal(call('units/'+other+'/history').data.positions.length,0);
-  assert.equal(call('units/'+id+'/history','GET',{},'usuario',[TRACKING_APP]).data.positions.length,1);
+  assert.throws(()=>call('units/'+id+'/history','GET',{},'usuario',[TRACKING_APP]),e=>e.status===404);
   assert.throws(()=>call('units/'+id+'/history?hours=9999'),e=>e.status===400);
   initializeTracking(db);assert.equal(db.prepare('SELECT COUNT(*) n FROM tracking_devices').get().n,1);
 });
@@ -120,4 +120,14 @@ test('Trackeo: registro integrado, sesión, acceso por aplicación y bloqueo de 
   assert.equal((await viewer.call('tracking/dashboard')).status,200);
   assert.equal((await viewer.call('tracking/units',{name:'blocked',identifier:'test',kind:'camera'})).status,403);
   assert.equal((await root.call('tracking/dashboard')).data.units.length,0);
+  // El centro usa los permisos de la app y las asignaciones, también por HTTP.
+  const unit=(await root.call('tracking/units',{name:'Privado HTTP',identifier:'KIT-HTTP',kind:'vehicle',user_ids:[id]})).data.id;
+  const gps=await root.call('tracking/devices',{name:'GPS privado HTTP',unit_id:unit,imei:'001234567890123',provider:'rinho'});assert.equal(gps.status,201);
+  assert.equal((await root.call('alerts/units/'+unit+'/rule',{stale_minutes:1,speed_limit:80},'PATCH')).status,200);
+  const viewerAlerts=await viewer.call('alerts/dashboard');assert.equal(viewerAlerts.status,200);assert.equal(viewerAlerts.data.canManage,false);
+  assert.equal((await viewer.call('alerts/configuration')).status,403);
+  assert.equal((await viewer.call('alerts/settings',{gb_percent:90},'PATCH')).status,403);
+  const config=await root.call('alerts/configuration');assert.equal(config.status,200);assert.equal(config.data.units[0].speed_limit,80);
+  assert.equal((await root.call('alerts/zones',{unit_id:unit,name:'Zona HTTP',lat:0,lon:0,radius:1,on_enter:true,on_exit:true,active:true})).status,201);
+  const asset=await fetch(origin+'/alerts.js');assert.equal(asset.status,200);assert.match(await asset.text(),/mountAlerts/);
 });

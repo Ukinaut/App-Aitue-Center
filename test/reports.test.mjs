@@ -9,7 +9,7 @@ import {reportCsv} from '../public/reports.js';
 const now=Date.parse('2026-10-20T12:00:00Z');
 test('Dashboard de Trackeo: filtros, conteos, fechas UTC e inventario sin inventar actividad',t=>{
   const db=new DatabaseSync(':memory:');t.after(()=>db.close());db.exec("CREATE TABLE users(id TEXT PRIMARY KEY);INSERT INTO users VALUES ('root');CREATE TABLE apps(id TEXT PRIMARY KEY,name TEXT,description TEXT,url TEXT,color TEXT);");initializeTracking(db);
-  const add=db.prepare('INSERT INTO tracking_units VALUES (?,?,?,?,?,?,?,?)');add.run('a','Vehículo A','0001','vehicle','',1,'2026-01-01','2026-01-01');add.run('b','Aeronave B','0002','aircraft','',0,'2026-01-01','2026-01-01');
+  const add=db.prepare('INSERT INTO tracking_units(id,name,identifier,kind,notes,active,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?)');add.run('a','Vehículo A','0001','vehicle','',1,'2026-01-01','2026-01-01');add.run('b','Aeronave B','0002','aircraft','',0,'2026-01-01','2026-01-01');
   db.exec("INSERT INTO tracking_devices(id,unit_id,name,provider,created_at) VALUES ('gps','a','GPS','rinho','2026-01-01');INSERT INTO tracking_cameras VALUES ('cam','gps','Frontal','1','hls','','2026-01-01');");
   const position=db.prepare('INSERT INTO tracking_positions(unit_id,lat,lon,source,recorded_at,actor_id,speed) VALUES (?,0,0,?,?,?,?)');
   position.run('a','manual','2026-10-20T10:00:00Z','root',null);position.run('a','rinho','2026-10-19T23:00:00Z','root',25);position.run('b','wialon','2026-10-19T11:00:00Z','root',100);position.run('a','rinho','2026-09-01T00:00:00Z','root',90);

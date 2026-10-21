@@ -2,6 +2,7 @@ import { randomUUID, randomBytes } from 'node:crypto';
 import { hashPassword } from './auth.mjs';
 import { buildTrackingReport } from './reports.mjs';
 import { createWialonClient } from './tracking-wialon.mjs';
+import { trackingScope, trackingIdentity, nextTrackingNumber } from './tracking-access.mjs';
 const wialon=createWialonClient();
 
 export const TRACKING_APP='aitue-trackeo-video';
@@ -29,31 +30,79 @@ export function initializeTracking(db){
     CREATE INDEX IF NOT EXISTS tracking_devices_unit ON tracking_devices(unit_id);`);
   const deviceColumns=new Set(db.prepare('PRAGMA table_info(tracking_devices)').all().map(r=>r.name));
   for(const name of ['ingest_hash','ingest_actor_id'])if(!deviceColumns.has(name))db.exec(`ALTER TABLE tracking_devices ADD COLUMN ${name} TEXT`);
+  db.exec('BEGIN IMMEDIATE');
+  try{
+    if(!db.prepare('PRAGMA table_info(tracking_units)').all().some(c=>c.name==='internal_number'))db.exec('ALTER TABLE tracking_units ADD COLUMN internal_number TEXT');
+    for(const u of db.prepare('SELECT id FROM tracking_units WHERE internal_number IS NULL ORDER BY rowid').all())db.prepare('UPDATE tracking_units SET internal_number=? WHERE id=?').run(nextTrackingNumber(db),u.id);
+    db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS tracking_internal_number ON tracking_units(internal_number COLLATE NOCASE);
+      CREATE TABLE IF NOT EXISTS tracking_unit_access(unit_id TEXT NOT NULL REFERENCES tracking_units(id),user_id TEXT NOT NULL REFERENCES users(id),PRIMARY KEY(unit_id,user_id));
+      CREATE INDEX IF NOT EXISTS tracking_access_user ON tracking_unit_access(user_id,unit_id);`);
+    db.exec('COMMIT');
+  }catch(error){db.exec('ROLLBACK');throw error;}
   db.prepare('INSERT OR IGNORE INTO apps VALUES (?,?,?,?,?)').run(TRACKING_APP,'Trackeo / Streaming de video','Seguimiento de unidades, ubicaciones y centro de video.','/?app=trackeo-video','teal');
 }
-export function handleTracking({db,actor,url,method,b,send,fail,transaction,log,service=wialon,receiver={status:{enabled:false,ready:false,port:5101,protocol:'Wialon IPS 1.x / TCP'}}}){
+export function handleTracking({db,actor,users=[],url,method,b,send,fail,transaction,log,service=wialon,receiver={status:{enabled:false,ready:false,port:5101,protocol:'Wialon IPS 1.x / TCP'}}}){
   if(actor.role!=='superadmin'&&!actor.apps.includes(TRACKING_APP))fail(403,'No tenés acceso a Trackeo / Streaming de video.');
   const manager=['superadmin','admin'].includes(actor.role),route=url.pathname.slice('/api/tracking/'.length);
-  if(route==='report'&&method==='GET')return send(200,buildTrackingReport(db,url.searchParams));
+  const scope=trackingScope(actor);
+  const visible=id=>!!db.prepare(`SELECT u.id FROM tracking_units u WHERE u.id=? AND ${scope.sql}`).get(id,...scope.values);
+  const assignees=manager?users.filter(u=>u.active&&['controlador','usuario'].includes(u.role)&&u.apps.includes(TRACKING_APP)).map(({id,name,role})=>({id,name,role})):[];
+  const assignments=ids=>{
+    if(!Array.isArray(ids)||ids.length>500||ids.some(id=>typeof id!=='string'||!assignees.some(u=>u.id===id)))fail(400,'Seleccioná controladores o usuarios finales activos con acceso a Trackeo.');
+    return [...new Set(ids)];
+  };
+  const saveAccess=(id,ids)=>{db.prepare('DELETE FROM tracking_unit_access WHERE unit_id=?').run(id);for(const userId of ids)db.prepare('INSERT INTO tracking_unit_access VALUES (?,?)').run(id,userId);};
+  const internalNumber=(old=null)=>{
+    const value=b.internal_number===undefined?(old?.internal_number||nextTrackingNumber(db)):b.internal_number;
+    if(typeof value!=='string'||!/^[a-z0-9][a-z0-9._/-]{0,39}$/i.test(value.trim()))fail(400,'El número interno admite hasta 40 letras, números, puntos, guiones, barras o guiones bajos.');
+    const number=value.trim();
+    if(db.prepare('SELECT id FROM tracking_units WHERE internal_number=? COLLATE NOCASE AND id<>?').get(number,old?.id||''))fail(409,'Ese número interno ya está registrado.');
+    return number;
+  };
+  if(route==='report'&&method==='GET')return send(200,buildTrackingReport(db,url.searchParams,Date.now(),actor));
   const units=()=>db.prepare(`SELECT u.*,p.lat,p.lon,p.source,p.recorded_at,p.speed,p.altitude,p.heading,p.device_id FROM tracking_units u
     LEFT JOIN tracking_positions p ON p.id=(SELECT id FROM tracking_positions WHERE unit_id=u.id ORDER BY recorded_at DESC,id DESC LIMIT 1)
-    ORDER BY u.active DESC,u.name,u.id`).all();
-  if(route==='dashboard'&&method==='GET')return send(200,{units:units(),devices:db.prepare('SELECT id,unit_id,name,imei,psn,manufacturer,model,provider,external_id,created_at,CASE WHEN ingest_hash IS NULL THEN 0 ELSE 1 END ingest_configured FROM tracking_devices ORDER BY name,id').all(),cameras:db.prepare('SELECT * FROM tracking_cameras ORDER BY name,id').all(),canManage:manager,gpsConnected:false,videoConnected:false,integrations:{wialon:{configured:service.configured()},rinho:{configured:receiver.status.ready,status:'ips_receiver',receiver:receiver.status,public_host:process.env.TRACKING_PUBLIC_HOST||''}}});
+    WHERE ${scope.sql} ORDER BY u.active DESC,u.name,u.id`).all(...scope.values);
+  if(route==='dashboard'&&method==='GET'){
+    const unitRows=units().map(u=>({...trackingIdentity(u,actor),...(manager?{assigned_users:db.prepare('SELECT user_id FROM tracking_unit_access WHERE unit_id=? ORDER BY user_id').all(u.id).map(a=>({id:a.user_id,name:users.find(x=>x.id===a.user_id)?.name||'Cuenta no disponible',role:users.find(x=>x.id===a.user_id)?.role||'',eligible:assignees.some(x=>x.id===a.user_id)}))}:{})}));
+    const ids=new Set(unitRows.map(u=>u.id));
+    const deviceRows=db.prepare('SELECT id,unit_id,name,imei,psn,manufacturer,model,provider,external_id,created_at,CASE WHEN ingest_hash IS NULL THEN 0 ELSE 1 END ingest_configured FROM tracking_devices ORDER BY name,id').all().filter(d=>manager||ids.has(d.unit_id)).map(d=>manager?d:{id:d.id,unit_id:d.unit_id,name:'GPS · '+unitRows.find(u=>u.id===d.unit_id).internal_number,created_at:d.created_at});
+    const deviceIds=new Set(deviceRows.map(d=>d.id));
+    const cameraRows=db.prepare('SELECT * FROM tracking_cameras ORDER BY device_id,created_at,id').all().filter(c=>manager||deviceIds.has(c.device_id)).map((c,i)=>manager?{...c,has_source:!!c.url}:{id:c.id,device_id:c.device_id,name:'Cámara '+(i+1),channel:String(i+1),format:c.format,has_source:!!c.url});
+    return send(200,{units:unitRows,devices:deviceRows,cameras:cameraRows,assignees,canManage:manager,gpsConnected:false,videoConnected:false,integrations:manager?{wialon:{configured:service.configured()},rinho:{configured:receiver.status.ready,status:'ips_receiver',receiver:receiver.status,public_host:process.env.TRACKING_PUBLIC_HOST||''}}:null});
+  }
+  const playback=route.match(/^cameras\/([a-z0-9-]+)\/playback$/i);
+  if(playback&&method==='GET'){
+    const c=db.prepare('SELECT c.*,d.unit_id,d.imei,d.psn,d.external_id FROM tracking_cameras c JOIN tracking_devices d ON d.id=c.device_id WHERE c.id=?').get(playback[1]);
+    if(!c||!manager&&!visible(c.unit_id))fail(404,'Cámara no encontrada en tu alcance.');
+    if(!c.url)fail(409,'La cámara todavía no tiene fuente configurada.');
+    // El navegador reproduce directamente. No entregar URLs con identidades reales incrustadas.
+    if(!manager){const u=db.prepare('SELECT identifier FROM tracking_units WHERE id=?').get(c.unit_id);let decoded=c.url;try{decoded=decodeURIComponent(c.url);}catch{}
+      if([c.imei,c.psn,c.external_id,u.identifier].filter(v=>v&&v.length>=4).some(v=>decoded.toLowerCase().includes(v.toLowerCase())))fail(409,'Un administrador debe configurar un enlace de video sin identificadores reales del equipo.');}
+    return send(200,{url:c.url,format:c.format});
+  }
   const history=route.match(/^units\/([a-z0-9-]+)\/history$/i);
   if(history&&method==='GET'){
-    if(!db.prepare('SELECT id FROM tracking_units WHERE id=?').get(history[1]))fail(404,'Unidad no encontrada.');
+    if(!visible(history[1]))fail(404,'Unidad no encontrada en tu alcance.');
     const hours=Number(url.searchParams.get('hours')||24);if(!Number.isInteger(hours)||hours<1||hours>168)fail(400,'Intervalo inválido.');
     const rows=db.prepare('SELECT lat,lon,recorded_at,source,speed,altitude,heading,device_id FROM tracking_positions WHERE unit_id=? AND recorded_at>=? ORDER BY recorded_at DESC,id DESC LIMIT 2001').all(history[1],new Date(Date.now()-hours*3600000).toISOString());
     return send(200,{positions:rows.slice(0,2000).reverse(),truncated:rows.length>2000,hours});
   }
   if(!manager)fail(403,'Solo los administradores pueden registrar unidades y posiciones.');
+  const assignment=route.match(/^units\/([a-z0-9-]+)\/assignment$/i);
+  if(assignment&&method==='PATCH'){
+    if(!visible(assignment[1]))fail(404,'Unidad no encontrada.');
+    const ids=assignments(b.user_ids);
+    transaction(()=>{saveAccess(assignment[1],ids);log(actor,'Asignó accesos de trackeo',assignment[1]);});
+    return send(200,{ok:true});
+  }
   const text=(key,max,required=false)=>{const value=b[key]??'';if(typeof value!=='string'||value.trim().length>max||(required&&!value.trim()))fail(400,'Revisá el campo '+key+'.');return value.trim();};
   if(route==='units'&&method==='POST'){
     const name=text('name',100,true),identifier=text('identifier',80,true),kind=text('kind',20,true),notes=text('notes',1000);
     if(!['vehicle','aircraft','person','equipment','camera','other'].includes(kind))fail(400,'Tipo de unidad inválido.');
     if(db.prepare('SELECT id FROM tracking_units WHERE identifier=?').get(identifier))fail(409,'Ya existe una unidad con ese identificador.');
-    const id=randomUUID(),now=new Date().toISOString();
-    transaction(()=>{db.prepare('INSERT INTO tracking_units VALUES (?,?,?,?,?,1,?,?)').run(id,name,identifier,kind,notes,now,now);log(actor,'Registró unidad de trackeo',name);});
+    const id=randomUUID(),now=new Date().toISOString(),number=internalNumber(),ids=assignments(b.user_ids??[]);
+    transaction(()=>{db.prepare('INSERT INTO tracking_units(id,name,identifier,kind,notes,active,created_at,updated_at,internal_number) VALUES (?,?,?,?,?,1,?,?,?)').run(id,name,identifier,kind,notes,now,now,number);saveAccess(id,ids);log(actor,'Registró unidad de trackeo',name);});
     return send(201,{id});
   }
   if(route==='integrations/wialon/sync'&&method==='POST')return service.units().then(items=>{
@@ -62,7 +111,7 @@ export function handleTracking({db,actor,url,method,b,send,fail,transaction,log,
       let device=db.prepare("SELECT * FROM tracking_devices WHERE provider='wialon' AND external_id=?").get(item.external_id);
       if(!device&&item.imei){const match=db.prepare('SELECT * FROM tracking_devices WHERE imei=?').get(item.imei);if(match){if(match.provider!=='wialon'||match.external_id&&match.external_id!==item.external_id){stats.conflicts++;continue;}device=match;db.prepare('UPDATE tracking_devices SET external_id=? WHERE id=?').run(item.external_id,device.id);}}
       if(!device){const identifier='WIALON-'+item.external_id;if(db.prepare('SELECT id FROM tracking_units WHERE identifier=?').get(identifier)){stats.conflicts++;continue;}
-        const unitId=randomUUID(),id=randomUUID();db.prepare('INSERT INTO tracking_units VALUES (?,?,?,?,?,1,?,?)').run(unitId,item.name,identifier,'equipment','Importada de Wialon; revisar tipo de unidad.',now,now);
+        const unitId=randomUUID(),id=randomUUID();db.prepare('INSERT INTO tracking_units(id,name,identifier,kind,notes,active,created_at,updated_at,internal_number) VALUES (?,?,?,?,?,1,?,?,?)').run(unitId,item.name,identifier,'equipment','Importada de Wialon; revisar tipo de unidad.',now,now,nextTrackingNumber(db));
         db.prepare('INSERT INTO tracking_devices(id,unit_id,name,imei,provider,external_id,created_at) VALUES (?,?,?,?,?,?,?)').run(id,unitId,item.name,item.imei,'wialon',item.external_id,now);device={id,unit_id:unitId};stats.created++;
       }
       const unit=device.unit_id&&db.prepare('SELECT active FROM tracking_units WHERE id=?').get(device.unit_id);
@@ -107,7 +156,8 @@ export function handleTracking({db,actor,url,method,b,send,fail,transaction,log,
   const unit=db.prepare('SELECT * FROM tracking_units WHERE id=?').get(match[1]);if(!unit)fail(404,'Unidad no encontrada.');
   if(!match[2]&&method==='PATCH'){
     const name=text('name',100,true),kind=text('kind',20,true),notes=text('notes',1000);if(!['vehicle','aircraft','person','equipment','camera','other'].includes(kind))fail(400,'Tipo inválido.');
-    transaction(()=>{db.prepare('UPDATE tracking_units SET name=?,kind=?,notes=?,updated_at=? WHERE id=?').run(name,kind,notes,new Date().toISOString(),unit.id);log(actor,'Editó unidad de trackeo',name);});return send(200,{ok:true});
+    const number=internalNumber(unit),ids=b.user_ids===undefined?null:assignments(b.user_ids);
+    transaction(()=>{db.prepare('UPDATE tracking_units SET name=?,kind=?,notes=?,internal_number=?,updated_at=? WHERE id=?').run(name,kind,notes,number,new Date().toISOString(),unit.id);if(ids!==null)saveAccess(unit.id,ids);log(actor,'Editó unidad de trackeo',name);});return send(200,{ok:true});
   }
   if(match[2]==='position'&&method==='POST'){
     if(!unit.active)fail(400,'Reactivá la unidad antes de registrar una posición.');

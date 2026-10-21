@@ -21,7 +21,7 @@ test('IPS 1.x: coordenadas, UTC, datos ausentes y rechazo de fechas o minutos in
 
 test('Receptor TCP: login, fragmentos, ACK después de guardar, duplicados y clave renovada',async t=>{
   const db=new DatabaseSync(':memory:');db.exec("PRAGMA foreign_keys=ON; CREATE TABLE users(id TEXT PRIMARY KEY,active INTEGER); INSERT INTO users VALUES ('root',1); CREATE TABLE apps(id TEXT PRIMARY KEY,name TEXT,description TEXT,url TEXT,color TEXT);");initializeTracking(db);
-  const now=new Date().toISOString();db.prepare('INSERT INTO tracking_units VALUES (?,?,?,?,?,1,?,?)').run('unit','Spider de prueba','KIT-TEST','vehicle','',now,now);
+  const now=new Date().toISOString();db.prepare('INSERT INTO tracking_units(id,name,identifier,kind,notes,active,created_at,updated_at) VALUES (?,?,?,?,?,1,?,?)').run('unit','Spider de prueba','KIT-TEST','vehicle','',now,now);
   db.prepare('INSERT INTO tracking_devices(id,unit_id,name,imei,provider,created_at,ingest_hash,ingest_actor_id) VALUES (?,?,?,?,?,?,?,?)').run('gps','unit','Spider','001234567890123','rinho',now,hashPassword('test-device-password'),'root');
   const receiver=startTrackingReceiver({db,enabled:true,host:'127.0.0.1',port:0});const clients=[];
   t.after(async()=>{for(const socket of clients)socket.destroy();await receiver.close();db.close();});assert.equal(await receiver.ready,true);
