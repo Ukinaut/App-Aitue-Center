@@ -1,11 +1,12 @@
 import { header, footer, logo } from './chrome.js';
 import { mountAlerts } from './alerts.js';
+import { mountOperations } from './operations.js';
 import { mountGb } from './gb.js';
 import { mountSatellite } from './satellite.js';
 import { mountTracking } from './tracking.js';
 const $ = s => document.querySelector(s);
 const app = $('#app');
-const initialView=()=>({'gestion-gb':'gb','reporte-satelital':'satellite','trackeo-video':'tracking','centro-alertas':'alertas'})[new URLSearchParams(location.search).get('app')]||'inicio';
+const initialView=()=>({'sistema':'sistema','gestion-gb':'gb','reporte-satelital':'satellite','trackeo-video':'tracking','centro-alertas':'alertas'})[new URLSearchParams(location.search).get('app')]||'inicio';
 let state, view=initialView(), disposeModule=()=>{};
 const roleNames = {superadmin:'Superadministrador',admin:'Administrador',controlador:'Controlador',usuario:'Usuario final'};
 const roleOrder = Object.keys(roleNames);
@@ -66,10 +67,10 @@ async function refresh(){state=await api('dashboard');render();}
 const canCreate=()=>state.user.role==='superadmin'||state.user.can_create;
 function render(){
   disposeModule();disposeModule=()=>{};
-  const u=state.user;const labels={alertas:'Centro de alertas',tracking:'Trackeo / Streaming de video',satellite:'Reporte satelital',gb:'Gestión de GB',inicio:'Resumen general',apps:'Aplicaciones',usuarios:'Usuarios y accesos',roles:'Roles y permisos',actividad:'Actividad'};
+  const u=state.user;if(view==='sistema'&&u.role!=='superadmin')view='inicio';const labels={sistema:'Estado del sistema',alertas:'Centro de alertas',tracking:'Trackeo / Streaming de video',satellite:'Reporte satelital',gb:'Gestión de GB',inicio:'Resumen general',apps:'Aplicaciones',usuarios:'Usuarios y accesos',roles:'Roles y permisos',actividad:'Actividad'};
   app.dataset.screen='dashboard';
   app.innerHTML=header(u,['gb','satellite','tracking'].includes(view)?'apps':view)+`<div class="shell" id="inicio"><div class="topbar"><div class="breadcrumb">Portal AITUE <span>/</span> <strong>${labels[view]}</strong></div><div class="topright"><span>${new Date().toLocaleDateString('es-AR',{day:'numeric',month:'long',year:'numeric'})}</span>${badge(u.role)}</div></div><main class="main" id="main"></main></div>`+footer(u,view);
-  if(view==='alertas')disposeModule=mountAlerts($('#main'),{api,toast});if(view==='tracking')disposeModule=mountTracking($('#main'),{api,toast});if(view==='satellite')disposeModule=mountSatellite($('#main'),{api,toast});if(view==='gb')mountGb($('#main'),{api,user:u,toast});if(view==='inicio')overview();if(view==='usuarios')usersScreen();if(view==='apps')appsScreen();if(view==='roles')rolesScreen();if(view==='actividad')activityScreen();
+  if(view==='sistema')disposeModule=mountOperations($('#main'),{api});if(view==='alertas')disposeModule=mountAlerts($('#main'),{api,toast});if(view==='tracking')disposeModule=mountTracking($('#main'),{api,toast});if(view==='satellite')disposeModule=mountSatellite($('#main'),{api,toast});if(view==='gb')mountGb($('#main'),{api,user:u,toast});if(view==='inicio')overview();if(view==='usuarios')usersScreen();if(view==='apps')appsScreen();if(view==='roles')rolesScreen();if(view==='actividad')activityScreen();
   document.querySelectorAll('[data-view]').forEach(btn=>btn.onclick=()=>{view=btn.dataset.view;render();window.scrollTo({top:0,behavior:'instant'});});
   $('#logout').onclick=async()=>{try{await post('logout',{});state=null;view='inicio';await boot();window.scrollTo({top:0,behavior:'instant'});}catch(e){toast(e.message);}};
   document.querySelectorAll('[data-action="new-user"]').forEach(el=>el.onclick=()=>userDialog());document.querySelectorAll('[data-action="new-app"]').forEach(el=>el.onclick=()=>appDialog());document.querySelectorAll('[data-goto]').forEach(el=>el.onclick=()=>{view=el.dataset.goto;render();window.scrollTo({top:0,behavior:'instant'});});

@@ -6,7 +6,10 @@
   "description": "Portal central de aplicaciones y permisos AITUE",
   "scripts": {
     "start": "node --env-file-if-exists=.env server.mjs",
-    "test": "node --test"
+    "test": "node --test",
+    "backup": "node --env-file-if-exists=.env scripts/backup.mjs create",
+    "backup:verify": "node --env-file-if-exists=.env scripts/backup.mjs verify",
+    "backup:restore": "node --env-file-if-exists=.env scripts/backup.mjs restore"
   },
   "engines": {
     "node": ">=24"

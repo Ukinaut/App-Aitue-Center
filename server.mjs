@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { DatabaseSync } from 'node:sqlite';
 import { randomBytes, randomUUID, createHash } from 'node:crypto';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { hashPassword, verifyPassword, roles, canManage, validateGrant } from './auth.mjs';
@@ -12,10 +12,12 @@ import { initializeTracking, handleTracking } from './tracking.mjs';
 import { startTrackingReceiver } from './tracking-receiver.mjs';
 import { initializeAlerts, evaluateAlerts, handleAlerts } from './alerts.mjs';
 import { handleExposure } from './exposure.mjs';
+import { createBackupService } from './backups.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, 'data');
 mkdirSync(dataDir, { recursive: true });
+if(existsSync(path.join(dataDir,'.restore-incomplete')))throw Error('La carpeta contiene una restauración incompleta. Elegí una restauración verificada.');
 const industryStore=createIndustryStore({dataDir});
 const db = new DatabaseSync(path.join(dataDir, 'aitue.sqlite'));
 db.exec(`PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
@@ -28,9 +30,11 @@ initializeGb(db);
 initializeSatellite(db);
 initializeTracking(db);
 initializeAlerts(db);
+const backupService=createBackupService({db,dataDir,backupDir:path.resolve(process.env.BACKUP_DIR||path.join(dataDir,'backups')),intervalHours:Number(process.env.BACKUP_INTERVAL_HOURS??24)});
+let stopping=false,lastManualBackup=0;
 const trackingReceiver=startTrackingReceiver({db});
 const evaluate=()=>{try{evaluateAlerts(db);}catch(error){console.error('No se pudieron evaluar las alertas.',error.message);}};
-evaluate();setInterval(evaluate,30000).unref();
+evaluate();const evaluationTimer=setInterval(evaluate,30000);evaluationTimer.unref();
 const all = () => db.prepare('SELECT id,name,email,role,parent_id,can_create,active,created_at FROM users ORDER BY created_at').all().map(u => ({ ...u, can_create: !!u.can_create, active: !!u.active, apps: db.prepare('SELECT app_id FROM grants WHERE user_id=?').all(u.id).map(x => x.app_id) }));
 const log = (actor, action, target) => db.prepare('INSERT INTO audit VALUES (?,?,?,?,?,?)').run(randomUUID(), actor?.id ?? null, actor?.name || 'Configuración inicial', action, target, new Date().toISOString());
 const digest = token => createHash('sha256').update(token).digest('hex');
@@ -54,6 +58,11 @@ const server = http.createServer(async (req, res) => {
   const cookie = (value, age) => `aitue_session=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${age}${secure ? '; Secure' : ''}`;
   const send = (status, payload) => { res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(payload)); };
   try {
+    if(['/healthz','/readyz'].includes(url.pathname)){
+      if(!['GET','HEAD'].includes(req.method))fail(405,'Método no permitido.');
+      let ready=!stopping;try{db.prepare('SELECT 1 FROM users LIMIT 1').get();if(trackingReceiver.status.enabled&&!trackingReceiver.status.ready)ready=false;}catch{ready=false;}
+      return send(ready?200:503,{status:ready?'ok':'unavailable'});
+    }
     if (!url.pathname.startsWith('/api/')) {
       if (!['GET','HEAD'].includes(req.method)) fail(405, 'Método no permitido.');
       const assets = { '/': ['index.html','text/html'], '/app.js': ['app.js','text/javascript'], '/theme.css': ['theme.css','text/css'], '/favicon.svg': ['favicon.svg','image/svg+xml'], '/fonts/manrope.ttf': ['fonts/manrope.ttf','font/ttf'], '/fonts/syne.ttf': ['fonts/syne.ttf','font/ttf'] };
@@ -66,6 +75,7 @@ const server = http.createServer(async (req, res) => {
         '/alerts.js': ['alerts.js','text/javascript'], '/alerts.css': ['alerts.css','text/css'],
         '/tracking.js': ['tracking.js','text/javascript'], '/tracking.css': ['tracking.css','text/css'],
         '/exposure.js': ['exposure.js','text/javascript'], '/exposure.css': ['exposure.css','text/css'],
+        '/operations.js': ['operations.js','text/javascript'], '/operations.css': ['operations.css','text/css'],
         '/satellite.js': ['satellite.js','text/javascript'], '/satellite-geometry.js': ['satellite-geometry.js','text/javascript'], '/satellite.css': ['satellite.css','text/css'],
         '/vendor/leaflet/leaflet.js': ['vendor/leaflet/leaflet.js','text/javascript'], '/vendor/leaflet/leaflet.css': ['vendor/leaflet/leaflet.css','text/css'],
         ...Object.fromEntries(['layers.png','layers-2x.png','marker-icon.png','marker-icon-2x.png','marker-shadow.png'].map(name=>['/vendor/leaflet/images/'+name,['vendor/leaflet/images/'+name,'image/png']])),
@@ -104,6 +114,15 @@ const server = http.createServer(async (req, res) => {
       newSession(row.id); log(row,'Inició sesión',row.name); return send(200, { ok: true });
     }
     if (!actor) fail(401, 'Iniciá sesión para continuar.');
+    if(url.pathname.startsWith('/api/operations/')){
+      if(actor.role!=='superadmin')fail(403,'Solo el superadministrador puede consultar la operación del sistema.');
+      if(url.pathname==='/api/operations/status'&&req.method==='GET')return send(200,{checked_at:new Date().toISOString(),uptime_seconds:Math.floor(process.uptime()),database:{ready:!!db.prepare("SELECT 1 FROM sqlite_schema WHERE name='users'").get(),bytes:statSync(path.join(dataDir,'aitue.sqlite')).size},receiver:{enabled:trackingReceiver.status.enabled,ready:trackingReceiver.status.ready},secure_cookies:secure,synced_data_folder:/onedrive/i.test(path.resolve(dataDir)),backups:await backupService.status()});
+      if(url.pathname==='/api/operations/backups'&&req.method==='POST'){
+        if(stopping)fail(503,'El servidor se está deteniendo.');if(Date.now()-lastManualBackup<60000)fail(429,'Esperá un minuto antes de solicitar otro respaldo.');
+        lastManualBackup=Date.now();try{const result=await backupService.run();log(actor,'Creó respaldo verificado',result.id);return send(201,result);}catch(error){if(error.status)throw error;console.error('No se pudo completar el respaldo.',error.code||'verification_failed');fail(503,'No se pudo completar el respaldo. Revisá el almacenamiento y la configuración del servidor.');}
+      }
+      fail(404,'Consulta de operación no encontrada.');
+    }
     if (url.pathname.startsWith('/api/alerts/')) return handleAlerts({db,actor,url,method:req.method,b,send,fail,transaction,log});
     if (['/api/exposure/report','/api/exposure/access'].includes(url.pathname)) return await handleExposure({db,actor,url,method:req.method,send,fail,currentActor:()=>db.prepare('SELECT 1 FROM sessions WHERE token=? AND expires>?').get(digest(rawToken),Date.now())?all().find(u=>u.id===actor.id&&u.active):null});
     if (url.pathname.startsWith('/api/tracking/')) return await handleTracking({db,actor,users,url,method:req.method,b,send,fail,transaction,log,receiver:trackingReceiver});
@@ -168,4 +187,11 @@ const server = http.createServer(async (req, res) => {
   } catch (e) { if (!e.status) console.error(e); send(e.status || 500, {error:e.status ? e.message : 'No se pudo completar la operación.'}); }
 });
 const host=process.env.HOST || '0.0.0.0';
-server.listen(Number(process.env.PORT || 3100),host,() => console.log(`AITUE disponible en http://${host}:${server.address().port}`));
+let backupStartup=Promise.resolve();
+server.listen(Number(process.env.PORT || 3100),host,() => {console.log(`AITUE disponible en http://${host}:${server.address().port}`);backupStartup=backupService.start();});
+async function shutdown(){
+  if(stopping)return;stopping=true;clearInterval(evaluationTimer);
+  const deadline=setTimeout(()=>process.exit(1),30000);deadline.unref();
+  try{const httpClosed=new Promise(resolve=>server.close(resolve));await trackingReceiver.close();await httpClosed;await backupStartup;await backupService.stop();db.close();clearTimeout(deadline);process.exit(0);}catch{process.exit(1);}
+}
+process.on('SIGTERM',shutdown);process.on('SIGINT',shutdown);

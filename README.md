@@ -39,9 +39,9 @@ Retirar una aplicación de una cuenta retira ese acceso de todos sus descendient
 
 ## Datos y operación
 
-SQLite crea `data/aitue.sqlite`, `data/aitue.sqlite-wal` y `data/aitue.sqlite-shm`. La carpeta contiene información privada. Conviene alojar los datos fuera de una carpeta sincronizada por OneDrive al usarlo en producción: configurar `DATA_DIR` a una carpeta local del servidor. Para respaldar de forma simple, detener el servidor y copiar toda la carpeta de datos; restaurarla con el servidor detenido. No subirla a Git ni compartirla como parte del código.
+SQLite crea `data/aitue.sqlite`, `data/aitue.sqlite-wal` y `data/aitue.sqlite-shm`. La carpeta contiene información privada. Conviene alojar los datos fuera de una carpeta sincronizada por OneDrive al usarlo en producción: configurar `DATA_DIR` a una carpeta local del servidor. Los respaldos automáticos verificables y la restauración a una carpeta nueva se describen en [Operación local](docs/operacion-local.md). Para copiar directamente toda la carpeta de datos, detener primero el servidor. No subirla a Git ni compartirla como parte del código.
 
-Variables opcionales: `PORT` (3100), `HOST` (127.0.0.1), `DATA_DIR` (ruta absoluta), `COOKIE_SECURE` (`true` cuando se publique con HTTPS). En producción, terminar HTTPS en un proxy confiable, configurar las cookies seguras y realizar el alta inicial antes de exponer el servidor. El limitador actual es por proceso e IP de conexión: detrás de un proxy se requiere un limitador acorde con su configuración.
+Variables opcionales: `PORT` (3100), `HOST` (0.0.0.0), `DATA_DIR` (ruta absoluta), `COOKIE_SECURE` (`true` cuando se publique con HTTPS). En producción, terminar HTTPS en un proxy confiable, configurar las cookies seguras y realizar el alta inicial antes de exponer el servidor. El limitador actual es por proceso e IP de conexión: detrás de un proxy se requiere un limitador acorde con su configuración.
 
 ## Integración de las demás aplicaciones
 
@@ -213,3 +213,14 @@ Compara eventos de los últimos siete días con la última posición no futura d
 La posición se clasifica reciente hasta 30 minutos por defecto (configurable de 1 a 1440), anterior o manual. Fuentes anteriores/no disponibles y posiciones anteriores/manuales quedan para revisión. Se muestran fechas del evento, de la posición y de consulta, además del nivel original de la fuente; no se deduce gravedad a partir de la distancia. Las coincidencias son relaciones unidad/evento: no son incidentes únicos ni confirman presencia histórica o peligro actual. Sin coincidencias no significa ausencia de peligro. Este panel no genera alertas automáticas ni notificaciones externas.
 
 Incluye filtros por unidad, fenómeno, fuente, relación y calidad de posición; indicadores, mapa, tabla paginada y CSV. Los resultados se actualizan cada cinco minutos y al volver a la pestaña. Si hay más de 2.000 coincidencias se informa la cobertura parcial en pantalla y CSV, conservando los totales del cálculo y permitiendo reducir filtros. No consulta proveedores cuando no hay unidades activas en alcance. No requiere cambiar el esquema de la base ni cargar muestras en el inventario real.
+
+
+## Infraestructura local (paso 7)
+
+El menú **Estado del sistema** (`/?app=sistema`) es exclusivo del superadministrador. Muestra disponibilidad de la base y del receptor GPS opcional, tiempo de actividad, configuración de cookies y respaldo automático/manual. El botón crea y verifica el respaldo en el almacenamiento del servidor; no entrega una descarga de los datos privados. Los intentos manuales se limitan a uno por minuto y las ejecuciones del panel y planificador no se superponen.
+
+Por defecto se verifica el último respaldo al iniciar y se genera uno si corresponde, con intervalo de 24 horas mientras el servidor esté funcionando. Incluye la base transaccional y el conjunto sectorial activo. Los archivos sectoriales inmutables se comparten por hash entre copias. Las verificaciones comprueban SHA-256 y la integridad SQLite; las copias incompletas no se publican como terminadas. No hay eliminación automática de respaldos. Conservar la carpeta completa, incluidos sus objetos, en otro disco.
+
+Comandos: `npm run backup`, `npm run backup:verify -- --backup RUTA` y `npm run backup:restore -- --backup RUTA --target CARPETA_NUEVA`. La restauración exige un destino nuevo, valida archivos y revoca las sesiones copiadas sin tocar los datos activos. El servidor no inicia desde una carpeta marcada como restauración incompleta. Variables nuevas: `BACKUP_DIR` y `BACKUP_INTERVAL_HOURS` (24; 0 para deshabilitar la programación). `.env.example` documenta también DATA_DIR y COOKIE_SECURE.
+
+`/healthz` y `/readyz` permiten comprobar disponibilidad sin exponer detalles privados. SIGINT/SIGTERM solicitan el cierre de HTTP, recepción GPS, respaldos y base, con un límite de 30 segundos. Estos controles no mantienen encendido el equipo ni sustituyen un servicio con reinicio automático. No se ha publicado la plataforma: todavía no hay servidor ni dominio elegidos. Instrucciones completas, alcances y restauración en [Operación local](docs/operacion-local.md).
