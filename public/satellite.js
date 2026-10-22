@@ -1,4 +1,5 @@
 import { mountReports } from './reports.js';
+import { mountExposure } from './exposure.js';
 import { mountIndustry } from './industry.js';
 import { mapAreaCopies } from './satellite-geometry.js';
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -13,7 +14,7 @@ export function mountSatellite(container,{api,toast}){
   let alive=true,map,markers,resizeObserver,selectedMarker,selected=null,data=null,busy=false,weatherVersion=0,searchVersion=0,shown=24;
   const filters={category:'',level:'',source:'',text:'',nearby:false};
   const eventLayers=new Map();let mapMode='areas',referenceKm=50,section='world',industryDispose=()=>{},mapStarting=false;
-  const sectorNames={dashboard:'Dashboard y reportes',world:'Monitoreo mundial',oil:'Petrolera',mining:'Mineras',agriculture:'Agrícola',nuclear:'Nuclear',renewable:'Renovable'};
+  const sectorNames={dashboard:'Dashboard y reportes',world:'Monitoreo mundial',exposure:'Eventos y unidades',oil:'Petrolera',mining:'Mineras',agriculture:'Agrícola',nuclear:'Nuclear',renewable:'Renovable'};
   const $=s=>container.querySelector(s);
   container.classList.add('satellite-app');
   container.innerHTML=`<div class="page-head sat-heading"><div><div class="eyebrow">AITUE CENTRAL / OBSERVACIÓN GLOBAL</div><h1>Reporte satelital</h1><p class="muted">Una mirada al planeta. Clima, eventos naturales y alertas en un mismo lugar.</p></div><div class="sat-head-actions"><span class="sat-auto"><i></i>Consulta automática · 5 min</span><button class="btn secondary" id="sat-refresh">↻ Actualizar</button></div></div>
@@ -101,9 +102,9 @@ export function mountSatellite(container,{api,toast}){
     if(!sectorNames[id])return;section=id;industryDispose();industryDispose=()=>{};
     $('#sat-monitoring').hidden=id!=='world';$('#sat-industry').hidden=id==='world';$('.sat-head-actions').hidden=id!=='world';
     container.querySelectorAll('[data-sat-sector]').forEach(btn=>btn.setAttribute('aria-pressed',String(btn.dataset.satSector===id)));
-    $('.sat-heading .muted').textContent=id==='world'?'Una mirada al planeta. Clima, eventos naturales y alertas en un mismo lugar.':id==='dashboard'?'Indicadores y reportes de eventos mundiales y cobertura sectorial disponible.':'Información por sector y país. Primera cobertura disponible: Argentina · Chubut.';
-    const url=new URL(location.href);if(id==='world'){url.searchParams.delete('sector');url.searchParams.delete('country');}else{url.searchParams.set('sector',id);if(id==='dashboard')url.searchParams.delete('country');else url.searchParams.set('country','AR');}history.replaceState(null,'',url);
-    if(id==='world'){initializeMap();map?.invalidateSize({pan:false});loadEvents();}else if(id==='dashboard')industryDispose=mountReports($('#sat-industry'),{api,mode:'satellite'});else industryDispose=mountIndustry($('#sat-industry'),{api,sector:id,toast});
+    $('.sat-heading .muted').textContent=id==='world'?'Una mirada al planeta. Clima, eventos naturales y alertas en un mismo lugar.':id==='exposure'?'Cruce de los eventos publicados con las últimas posiciones disponibles de tus unidades.':id==='dashboard'?'Indicadores y reportes de eventos mundiales y cobertura sectorial disponible.':'Información por sector y país. Primera cobertura disponible: Argentina · Chubut.';
+    const url=new URL(location.href);if(id==='world'){url.searchParams.delete('sector');url.searchParams.delete('country');}else{url.searchParams.set('sector',id);if(['dashboard','exposure'].includes(id))url.searchParams.delete('country');else url.searchParams.set('country','AR');}history.replaceState(null,'',url);
+    if(id==='world'){initializeMap();map?.invalidateSize({pan:false});loadEvents();}else if(id==='dashboard')industryDispose=mountReports($('#sat-industry'),{api,mode:'satellite'});else if(id==='exposure')industryDispose=mountExposure($('#sat-industry'),{api});else industryDispose=mountIndustry($('#sat-industry'),{api,sector:id,toast});
   }
   container.querySelectorAll('[data-sat-sector]').forEach(btn=>btn.onclick=()=>changeSection(btn.dataset.satSector));
   const requested=new URLSearchParams(location.search).get('sector');changeSection(sectorNames[requested]?requested:'dashboard');

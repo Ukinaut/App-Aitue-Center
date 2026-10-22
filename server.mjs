@@ -11,6 +11,7 @@ import { createIndustryStore, handleIndustry } from './industry.mjs';
 import { initializeTracking, handleTracking } from './tracking.mjs';
 import { startTrackingReceiver } from './tracking-receiver.mjs';
 import { initializeAlerts, evaluateAlerts, handleAlerts } from './alerts.mjs';
+import { handleExposure } from './exposure.mjs';
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 const dataDir = process.env.DATA_DIR || path.join(root, 'data');
@@ -64,6 +65,7 @@ const server = http.createServer(async (req, res) => {
         '/reports.js': ['reports.js','text/javascript'], '/reports.css': ['reports.css','text/css'],
         '/alerts.js': ['alerts.js','text/javascript'], '/alerts.css': ['alerts.css','text/css'],
         '/tracking.js': ['tracking.js','text/javascript'], '/tracking.css': ['tracking.css','text/css'],
+        '/exposure.js': ['exposure.js','text/javascript'], '/exposure.css': ['exposure.css','text/css'],
         '/satellite.js': ['satellite.js','text/javascript'], '/satellite-geometry.js': ['satellite-geometry.js','text/javascript'], '/satellite.css': ['satellite.css','text/css'],
         '/vendor/leaflet/leaflet.js': ['vendor/leaflet/leaflet.js','text/javascript'], '/vendor/leaflet/leaflet.css': ['vendor/leaflet/leaflet.css','text/css'],
         ...Object.fromEntries(['layers.png','layers-2x.png','marker-icon.png','marker-icon-2x.png','marker-shadow.png'].map(name=>['/vendor/leaflet/images/'+name,['vendor/leaflet/images/'+name,'image/png']])),
@@ -103,6 +105,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (!actor) fail(401, 'Iniciá sesión para continuar.');
     if (url.pathname.startsWith('/api/alerts/')) return handleAlerts({db,actor,url,method:req.method,b,send,fail,transaction,log});
+    if (['/api/exposure/report','/api/exposure/access'].includes(url.pathname)) return await handleExposure({db,actor,url,method:req.method,send,fail,currentActor:()=>db.prepare('SELECT 1 FROM sessions WHERE token=? AND expires>?').get(digest(rawToken),Date.now())?all().find(u=>u.id===actor.id&&u.active):null});
     if (url.pathname.startsWith('/api/tracking/')) return await handleTracking({db,actor,users,url,method:req.method,b,send,fail,transaction,log,receiver:trackingReceiver});
     if (url.pathname.startsWith('/api/industry/')) return handleIndustry({store:industryStore,actor,url,method:req.method,send,fail,res});
     if (url.pathname.startsWith('/api/satellite/')) return await handleSatellite({actor,url,method:req.method,send,fail});
